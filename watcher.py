@@ -1,34 +1,34 @@
 #!/usr/bin/env python3
 """
-Amazon Deal Watcher
-===================
-Отслеживает скидки на Amazon через Keepa API по заданным брендам, размерам
-и порогам скидки. При нахождении подходящего предложения шлёт уведомление
-в Telegram. Дедуплицирует уже отправленные предложения.
+Amazon Deal Watcher (бесплатная версия — прямой парсинг Amazon)
+===============================================================
+Отслеживает скидки на Amazon.com по брендам, размерам и порогу скидки,
+парся страницы поиска напрямую (без платных API). При нахождении
+подходящего предложения шлёт уведомление в Telegram. Дедуплицирует.
 
-Запускается как бесконечный цикл (для сервера/Docker) либо разово (для cron).
+ВАЖНО: Amazon блокирует автоматические запросы с серверных IP (капча).
+Скрипт распознаёт капчу и предупреждает, но обойти её не может. Это
+осознанный компромисс ради полностью бесплатного решения.
 
-Автор: сгенерировано для Seva.
+Запускается как бесконечный цикл (для сервера/Render) либо разово (cron).
 """
 
 import os
+import re
 import sys
 import time
 import json
+import random
 import logging
 import threading
 from pathlib import Path
 from datetime import datetime
+from urllib.parse import quote_plus
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import yaml
 import requests
-
-try:
-    import keepa
-except ImportError:
-    print("Не установлен пакет 'keepa'. Выполните: pip install -r requirements.txt")
-    sys.exit(1)
+from bs4 import BeautifulSoup
 
 
 # --------------------------------------------------------------------------- #
@@ -36,8 +36,19 @@ except ImportError:
 # --------------------------------------------------------------------------- #
 
 BASE_DIR = Path(__file__).resolve().parent
-STATE_FILE = BASE_DIR / "seen_deals.json"       # дедуп уже отправленных
+STATE_FILE = BASE_DIR / "seen_deals.json"
 CONFIG_FILE = BASE_DIR / "config.yaml"
+
+DOMAINS = {"US": "www.amazon.com", "DE": "www.amazon.de", "UK": "www.amazon.co.uk"}
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -64,7 +75,7 @@ def env(name: str, required: bool = True, default: str | None = None) -> str | N
 
 
 # --------------------------------------------------------------------------- #
-# Хранилище отправленных предложений (дедуп)
+# Дедуп
 # --------------------------------------------------------------------------- #
 
 def load_seen() -> dict:
@@ -77,14 +88,12 @@ def load_seen() -> dict:
 
 
 def save_seen(seen: dict) -> None:
-    # чистим записи старше 30 дней, чтобы файл не рос бесконечно
     cutoff = time.time() - 30 * 86400
     seen = {k: v for k, v in seen.items() if v > cutoff}
     STATE_FILE.write_text(json.dumps(seen), encoding="utf-8")
 
 
 def deal_key(asin: str, price_cents: int) -> str:
-    """Уникальный ключ предложения = ASIN + цена. Изменилась цена → новое уведомление."""
     return f"{asin}:{price_cents}"
 
 
@@ -97,12 +106,8 @@ def send_telegram(token: str, chat_id: str, text: str) -> bool:
     try:
         r = requests.post(
             url,
-            data={
-                "chat_id": chat_id,
-                "text": text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": False,
-            },
+            data={"chat_id": chat_id, "text": text,
+                  "parse_mode": "HTML", "disable_web_page_preview": False},
             timeout=20,
         )
         if r.status_code != 200:
@@ -115,66 +120,101 @@ def send_telegram(token: str, chat_id: str, text: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# Логика фильтрации
+# Парсинг Amazon
 # --------------------------------------------------------------------------- #
 
-def size_matches(product: dict, wanted_sizes: list[str]) -> bool:
-    """
-    Best-effort проверка размера. Keepa не гарантирует наличие размера в стоке,
-    поэтому проверяем по названию и атрибутам вариаций. Если размеры не заданы —
-    считаем, что подходит любой.
-    """
+def price_to_cents(text: str) -> int | None:
+    if not text:
+        return None
+    m = re.search(r"[\d,]+\.\d{2}", text)
+    if not m:
+        return None
+    return int(round(float(m.group(0).replace(",", "")) * 100))
+
+
+def is_captcha(html: str) -> bool:
+    markers = ["Enter the characters you see below",
+               "Type the characters you see in this image",
+               "/errors/validateCaptcha", "Robot Check",
+               "api-services-support@amazon.com"]
+    return any(m in html for m in markers)
+
+
+def fetch_search(session: requests.Session, domain_host: str, query: str) -> str | None:
+    url = f"https://{domain_host}/s?k={quote_plus(query)}"
+    headers = {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": f"https://{domain_host}/",
+        "Upgrade-Insecure-Requests": "1",
+    }
+    try:
+        r = session.get(url, headers=headers, timeout=25)
+    except requests.RequestException as e:
+        log.error("Запрос '%s' упал: %s", query, e)
+        return None
+    if r.status_code != 200:
+        log.warning("HTTP %s для запроса '%s'", r.status_code, query)
+    if is_captcha(r.text):
+        log.warning("⚠️  Amazon показал капчу для '%s' — IP заблокирован для парсинга", query)
+        return None
+    return r.text
+
+
+def parse_results(html: str, domain_host: str) -> list[dict]:
+    """Достаёт карточки товаров из HTML страницы поиска."""
+    soup = BeautifulSoup(html, "lxml")
+    items = []
+    for card in soup.select('div[data-component-type="s-search-result"]'):
+        asin = card.get("data-asin") or ""
+        if not asin:
+            continue
+
+        # заголовок + ссылка
+        h2 = card.select_one("h2")
+        title = h2.get_text(strip=True) if h2 else ""
+        link_el = card.select_one("h2 a") or card.select_one("a.a-link-normal")
+        href = link_el.get("href") if link_el else ""
+        url = f"https://{domain_host}{href}" if href.startswith("/") else \
+              (href or f"https://{domain_host}/dp/{asin}")
+
+        # текущая цена
+        cur_el = card.select_one("span.a-price > span.a-offscreen")
+        current = price_to_cents(cur_el.get_text()) if cur_el else None
+
+        # прежняя (зачёркнутая) цена
+        was_el = card.select_one("span.a-price.a-text-price > span.a-offscreen")
+        reference = price_to_cents(was_el.get_text()) if was_el else None
+
+        if current is None:
+            continue
+
+        items.append({
+            "asin": asin, "title": title, "url": url,
+            "current": current, "reference": reference,
+        })
+    return items
+
+
+# --------------------------------------------------------------------------- #
+# Фильтрация
+# --------------------------------------------------------------------------- #
+
+def size_matches(title: str, wanted_sizes: list[str]) -> bool:
     if not wanted_sizes:
         return True
-
-    haystacks = []
-    title = (product.get("title") or "").lower()
-    haystacks.append(title)
-
-    # атрибуты вариаций (Keepa возвращает variationAttributes при наличии)
-    for attr in product.get("variationAttributes", []) or []:
-        val = str(attr.get("value", "")).lower()
-        haystacks.append(val)
-
-    blob = " ".join(haystacks)
+    blob = (title or "").lower()
     for s in wanted_sizes:
         s = str(s).lower().strip()
-        # окружаем нецифробуквенными границами, чтобы "10" не ловил "100"
-        import re
         if re.search(rf"(^|[^0-9a-z]){re.escape(s)}([^0-9a-z]|$)", blob):
             return True
     return False
 
 
-def discount_percent(product: dict) -> float | None:
-    """
-    Считает % скидки от list price / прежней цены к текущей цене NEW.
-    Возвращает None, если данных недостаточно.
-    """
-    stats = product.get("stats") or {}
-    # текущая цена (в центах); -1 = нет данных
-    current = None
-    cur_arr = stats.get("current")
-    if isinstance(cur_arr, list) and len(cur_arr) > 1:
-        current = cur_arr[1]  # индекс 1 = NEW
-        if current is not None and current < 0:
-            current = None
-
-    # опорная (прежняя) цена: берём максимум из list price и 90-дневного среднего
-    reference_candidates = []
-    if product.get("listPrice") and product["listPrice"] > 0:
-        reference_candidates.append(product["listPrice"])
-    avg90 = stats.get("avg90")
-    if isinstance(avg90, list) and len(avg90) > 1 and avg90[1] and avg90[1] > 0:
-        reference_candidates.append(avg90[1])
-
-    if current is None or not reference_candidates:
+def discount_percent(current: int | None, reference: int | None) -> float | None:
+    if not current or not reference or reference <= current:
         return None
-
-    reference = max(reference_candidates)
-    if reference <= 0 or current >= reference:
-        return None
-
     return round((reference - current) / reference * 100, 1)
 
 
@@ -184,84 +224,40 @@ def format_price(cents: int | None) -> str:
     return f"${cents / 100:.2f}"
 
 
-def check_watch(api, watch: dict) -> list[dict]:
-    """Проверяет один блок правил (обувь или одежда конкретного бренда)."""
+def check_watch(session, watch: dict) -> list[dict]:
     hits = []
-    brand = watch["brand"]
+    label = watch.get("label", watch.get("brand", "—"))
+    query = watch["query"]
     min_discount = watch["min_discount"]
     wanted_sizes = watch.get("sizes", [])
-    domain = watch.get("domain", "US")
+    domain_host = DOMAINS.get(watch.get("domain", "US"), DOMAINS["US"])
 
-    log.info("→ Проверяю бренд '%s' (скидка ≥%s%%, размеры %s)",
-             brand, min_discount, wanted_sizes or "любые")
+    log.info("→ '%s' (скидка ≥%s%%, размеры %s)",
+             query, min_discount, wanted_sizes or "любые")
 
-    # 1) находим ASIN'ы бренда через Product Finder
-    selection = {
-        "brand": [brand],
-        "productType": [0, 1],   # 0 = стандарт, 1 = вариация
-        "perPage": watch.get("max_products", 50),
-        "sort": [["current_SALES", "asc"]],
-    }
-    # ограничим категорией, если задана
-    if watch.get("root_category"):
-        selection["rootCategory"] = watch["root_category"]
-
-    try:
-        asins = api.product_finder(selection, domain=domain)
-    except Exception as e:
-        log.error("Product Finder ошибка для '%s': %s", brand, e)
+    html = fetch_search(session, domain_host, query)
+    if not html:
         return hits
 
-    if not asins:
-        log.info("   бренд '%s': товаров не найдено", brand)
-        return hits
-
-    # 2) запрашиваем детали (с историей и статистикой)
-    try:
-        products = api.query(asins, domain=domain, stats=90, history=False)
-    except Exception as e:
-        log.error("Query ошибка для '%s': %s", brand, e)
-        return hits
-
-    for p in products:
-        disc = discount_percent(p)
+    for p in parse_results(html, domain_host):
+        disc = discount_percent(p["current"], p["reference"])
         if disc is None or disc < min_discount:
             continue
-        if not size_matches(p, wanted_sizes):
+        if not size_matches(p["title"], wanted_sizes):
             continue
+        hits.append({**p, "brand": watch.get("brand", ""),
+                     "category": label, "discount": disc})
 
-        stats = p.get("stats") or {}
-        cur_arr = stats.get("current") or []
-        current = cur_arr[1] if len(cur_arr) > 1 else None
-
-        hits.append({
-            "asin": p.get("asin"),
-            "title": p.get("title", "—"),
-            "brand": brand,
-            "category": watch.get("label", brand),
-            "current": current,
-            "reference": max(
-                [x for x in [p.get("listPrice"),
-                             (stats.get("avg90") or [None, None])[1]] if x and x > 0]
-                or [0]
-            ),
-            "discount": disc,
-            "sizes": wanted_sizes,
-            "url": f"https://www.amazon.com/dp/{p.get('asin')}",
-        })
-    log.info("   бренд '%s': подходящих предложений — %d", brand, len(hits))
+    log.info("   '%s': подходящих — %d", query, len(hits))
     return hits
 
 
 def build_message(hits: list[dict]) -> str:
     today = datetime.now().strftime("%d.%m.%Y %H:%M")
     lines = [f"🛒 <b>Amazon — подходящие скидки</b> ({today})", ""]
-
-    # группируем по label (Обувь / Одежда)
     by_cat: dict[str, list[dict]] = {}
     for h in hits:
         by_cat.setdefault(h["category"], []).append(h)
-
     for cat, items in by_cat.items():
         items.sort(key=lambda x: x["discount"], reverse=True)
         lines.append(f"<b>{cat}</b>")
@@ -275,13 +271,12 @@ def build_message(hits: list[dict]) -> str:
                 f'(было {format_price(h["reference"])}, −{h["discount"]:.0f}%)'
             )
         lines.append("")
-
     lines.append("⚡️ Хорошие размеры разбирают быстро — проверьте наличие сразу.")
     return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
-# Health-эндпоинт для Render (чтобы free web-сервис не засыпал)
+# Health-эндпоинт для Render
 # --------------------------------------------------------------------------- #
 
 _LAST_RUN = {"ts": None, "hits": 0}
@@ -292,25 +287,22 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
-        body = json.dumps({
+        self.wfile.write(json.dumps({
             "status": "alive",
             "last_run": _LAST_RUN["ts"],
             "last_hits": _LAST_RUN["hits"],
-        })
-        self.wfile.write(body.encode("utf-8"))
+        }).encode("utf-8"))
 
-    def log_message(self, *args):  # тишина в логах пинга
+    def log_message(self, *args):
         pass
 
 
 def start_health_server():
-    """Render задаёт PORT. Открываем порт, чтобы сервис считался живым web-сервисом."""
     port = os.environ.get("PORT")
     if not port:
         return
     server = HTTPServer(("0.0.0.0", int(port)), HealthHandler)
-    t = threading.Thread(target=server.serve_forever, daemon=True)
-    t.start()
+    threading.Thread(target=server.serve_forever, daemon=True).start()
     log.info("Health-сервер запущен на порту %s", port)
 
 
@@ -318,18 +310,22 @@ def start_health_server():
 # Основной цикл
 # --------------------------------------------------------------------------- #
 
-def run_once(api, cfg, telegram_token, telegram_chat) -> None:
+def run_once(cfg, telegram_token, telegram_chat) -> None:
     seen = load_seen()
     all_hits = []
+    session = requests.Session()
 
-    for watch in cfg["watches"]:
-        hits = check_watch(api, watch)
+    for i, watch in enumerate(cfg["watches"]):
+        hits = check_watch(session, watch)
         for h in hits:
             key = deal_key(h["asin"], h["current"] or 0)
             if key in seen:
-                continue          # уже уведомляли об этом предложении
+                continue
             seen[key] = time.time()
             all_hits.append(h)
+        # случайная пауза между брендами, чтобы меньше походить на бота
+        if i < len(cfg["watches"]) - 1:
+            time.sleep(random.uniform(5, 15))
 
     _LAST_RUN["ts"] = datetime.now().isoformat(timespec="seconds")
     _LAST_RUN["hits"] = len(all_hits)
@@ -340,7 +336,7 @@ def run_once(api, cfg, telegram_token, telegram_chat) -> None:
             log.info("Отправлено уведомление: %d новых предложений", len(all_hits))
             save_seen(seen)
         else:
-            log.error("Не удалось отправить — не сохраняю дедуп, повторим позже")
+            log.error("Не удалось отправить — повторим позже")
     else:
         log.info("Новых подходящих предложений нет — уведомление не шлём")
         save_seen(seen)
@@ -348,29 +344,24 @@ def run_once(api, cfg, telegram_token, telegram_chat) -> None:
 
 def main() -> None:
     cfg = load_config()
-
-    keepa_key = env("KEEPA_API_KEY")
     telegram_token = env("TELEGRAM_BOT_TOKEN")
     telegram_chat = env("TELEGRAM_CHAT_ID")
 
     interval = int(os.environ.get("CHECK_INTERVAL_MINUTES",
-                                  cfg.get("check_interval_minutes", 15)))
-    run_mode = os.environ.get("RUN_MODE", "loop")  # loop | once
+                                  cfg.get("check_interval_minutes", 20)))
+    run_mode = os.environ.get("RUN_MODE", "loop")
 
-    log.info("Запуск Amazon Deal Watcher (режим: %s, интервал: %d мин)",
+    log.info("Запуск Amazon Deal Watcher (парсинг; режим: %s, интервал: %d мин)",
              run_mode, interval)
-
-    start_health_server()   # только если задан PORT (Render)
-
-    api = keepa.Keepa(keepa_key)
+    start_health_server()
 
     if run_mode == "once":
-        run_once(api, cfg, telegram_token, telegram_chat)
+        run_once(cfg, telegram_token, telegram_chat)
         return
 
     while True:
         try:
-            run_once(api, cfg, telegram_token, telegram_chat)
+            run_once(cfg, telegram_token, telegram_chat)
         except Exception as e:
             log.exception("Ошибка в цикле проверки: %s", e)
         log.info("Следующая проверка через %d мин", interval)

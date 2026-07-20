@@ -1,55 +1,50 @@
 # =============================================================================
-# Amazon Deal Watcher — конфигурация правил отслеживания
+# Amazon Deal Watcher — конфигурация правил (бесплатная версия, парсинг Amazon)
 # =============================================================================
-# Меняйте бренды, размеры и пороги скидки прямо здесь. После правок
-# перезапустите сервис (на Render — "Manual Deploy" или он подхватит push).
-# =============================================================================
-
-# Как часто проверять (минуты). Можно переопределить переменной CHECK_INTERVAL_MINUTES.
-check_interval_minutes: 15
-
-# Список правил. Каждое правило = один бренд + свои условия.
+# query   — поисковый запрос для Amazon (как будто вводите в строку поиска)
 # label   — раздел в уведомлении (Обувь / Одежда)
-# brand   — точное имя бренда как в Amazon/Keepa
-# sizes   — искомые размеры (best-effort: ищутся в названии и вариациях)
-# min_discount — минимальный % скидки, чтобы считать предложение интересным
-# domain  — маркетплейс: US, DE, UK и т.д.
-# root_category — (опц.) ограничить категорией Amazon (числовой id), ускоряет поиск
+# brand   — бренд (для подписи)
+# sizes   — искомые размеры (ищутся в названии товара, best-effort)
+# min_discount — минимальный % скидки (считается от зачёркнутой цены)
+# domain  — US / DE / UK
+# =============================================================================
+
+check_interval_minutes: 20
 
 watches:
   # --------------------------- ОБУВЬ (10 US, ≥60%) --------------------------
   - label: "👞 Обувь"
     brand: "HUGO"
-    sizes: ["10", "10 US", "US 10"]
+    query: "HUGO men shoes size 10"
+    sizes: ["10"]
     min_discount: 60
     domain: "US"
-    max_products: 50
 
   - label: "👞 Обувь"
     brand: "GANT"
-    sizes: ["10", "10 US", "US 10"]
+    query: "GANT men shoes size 10"
+    sizes: ["10"]
     min_discount: 60
     domain: "US"
-    max_products: 50
 
   # --------------------------- ОДЕЖДА (M/L, ≥70%) ---------------------------
   - label: "👕 Одежда"
     brand: "GANT"
+    query: "GANT men shirt"
     sizes: ["M", "L", "Medium", "Large"]
     min_discount: 70
     domain: "US"
-    max_products: 50
 
   - label: "👕 Одежда"
     brand: "Lacoste"
+    query: "Lacoste men polo"
     sizes: ["M", "L", "Medium", "Large"]
     min_discount: 70
     domain: "US"
-    max_products: 50
 
   - label: "👕 Одежда"
     brand: "Hugo Boss"
+    query: "Hugo Boss men shirt"
     sizes: ["M", "L", "Medium", "Large"]
     min_discount: 70
     domain: "US"
-    max_products: 50
