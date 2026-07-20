@@ -355,6 +355,16 @@ def main() -> None:
              run_mode, interval)
     start_health_server()
 
+    # Само-тест доставки в Telegram: задайте env SEND_TEST=1 и перезапустите,
+    # чтобы получить одно тестовое сообщение (проверка бота, минуя парсинг).
+    if os.environ.get("SEND_TEST") == "1":
+        ok = send_telegram(
+            telegram_token, telegram_chat,
+            "✅ <b>Amazon Deal Watcher</b>\nТестовое сообщение — бот и уведомления работают. "
+            "Уберите переменную SEND_TEST, чтобы не повторять."
+        )
+        log.info("SEND_TEST: тестовое сообщение отправлено — %s", ok)
+
     if run_mode == "once":
         run_once(cfg, telegram_token, telegram_chat)
         return

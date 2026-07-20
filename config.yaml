@@ -39,7 +39,7 @@ watches:
     brand: "Lacoste"
     query: "Lacoste men polo"
     sizes: ["M", "L", "Medium", "Large"]
-    min_discount: 1          # ВРЕМЕННО снижено для теста уведомления (вернуть на 70)
+    min_discount: 70
     domain: "US"
 
   - label: "👕 Одежда"
