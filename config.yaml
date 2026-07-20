@@ -1,50 +1,57 @@
 # =============================================================================
-# Amazon Deal Watcher — конфигурация правил (бесплатная версия, парсинг Amazon)
+# Amazon Deal Watcher — правила отслеживания (пороги по цене)
 # =============================================================================
-# query   — поисковый запрос для Amazon (как будто вводите в строку поиска)
-# label   — раздел в уведомлении (Обувь / Одежда)
-# brand   — бренд (для подписи)
-# sizes   — искомые размеры (ищутся в названии товара, best-effort)
-# min_discount — минимальный % скидки (считается от зачёркнутой цены)
-# domain  — US / DE / UK
+# query          — поисковый запрос для Amazon
+# max_price      — уведомлять, если цена НИЖЕ этой суммы (USD)
+# min_discount   — (опц.) дополнительный порог по % скидки
+# sizes          — искомые размеры (ищутся в названии товара, best-effort)
+# must_match_any — группы обязательных слов: каждая группа должна найтись
+#                  в названии, внутри группы достаточно одного варианта
+# domain         — US / DE / UK
 # =============================================================================
 
 check_interval_minutes: 20
 
 watches:
-  # --------------------------- ОБУВЬ (10 US, ≥60%) --------------------------
+  # ---------------- ОБУВЬ: Hugo / Hugo Boss / Gant, 10 US, ниже $55 ---------
+  - label: "👞 Обувь"
+    brand: "HUGO / Hugo Boss"
+    query: "Hugo Boss men shoes size 10"
+    sizes: ["10"]
+    max_price: 55
+    domain: "US"
+
   - label: "👞 Обувь"
     brand: "HUGO"
-    query: "HUGO men shoes size 10"
+    query: "HUGO men sneakers size 10"
     sizes: ["10"]
-    min_discount: 60
+    max_price: 55
     domain: "US"
 
   - label: "👞 Обувь"
     brand: "GANT"
     query: "GANT men shoes size 10"
     sizes: ["10"]
-    min_discount: 60
+    max_price: 55
     domain: "US"
 
-  # --------------------------- ОДЕЖДА (M/L, ≥70%) ---------------------------
-  - label: "👕 Одежда"
-    brand: "GANT"
-    query: "GANT men shirt"
-    sizes: ["M", "L", "Medium", "Large"]
-    min_discount: 70
-    domain: "US"
-
-  - label: "👕 Одежда"
+  # -------- LACOSTE ПОЛО: Peppermint / Lime Green, L, Classic Fit, < $47 ----
+  - label: "👕 Lacoste поло"
     brand: "Lacoste"
-    query: "Lacoste men polo"
-    sizes: ["M", "L", "Medium", "Large"]
-    min_discount: 70
+    query: "Lacoste men polo classic fit peppermint"
+    sizes: ["L", "Large"]
+    max_price: 47
+    must_match_any:
+      - ["peppermint"]
+      - ["classic fit", "classic-fit"]
     domain: "US"
 
-  - label: "👕 Одежда"
-    brand: "Hugo Boss"
-    query: "Hugo Boss men shirt"
-    sizes: ["M", "L", "Medium", "Large"]
-    min_discount: 70
+  - label: "👕 Lacoste поло"
+    brand: "Lacoste"
+    query: "Lacoste men polo classic fit lime green"
+    sizes: ["L", "Large"]
+    max_price: 47
+    must_match_any:
+      - ["lime green", "lime"]
+      - ["classic fit", "classic-fit"]
     domain: "US"

@@ -2,15 +2,19 @@
 """
 Amazon Deal Watcher (бесплатная версия — прямой парсинг Amazon)
 ===============================================================
-Отслеживает скидки на Amazon.com по брендам, размерам и порогу скидки,
-парся страницы поиска напрямую (без платных API). При нахождении
-подходящего предложения шлёт уведомление в Telegram. Дедуплицирует.
+Отслеживает товары на Amazon по правилам из config.yaml:
+- порог по абсолютной цене (max_price, USD) и/или по % скидки (min_discount)
+- фильтр по размеру (sizes) и обязательным словам в названии
+  (must_match_any: цвет, крой и т.п.)
+
+При нахождении подходящего предложения шлёт уведомление в Telegram.
+Дедуплицирует уже отправленные предложения (seen_deals.json).
 
 ВАЖНО: Amazon блокирует автоматические запросы с серверных IP (капча).
-Скрипт распознаёт капчу и предупреждает, но обойти её не может. Это
-осознанный компромисс ради полностью бесплатного решения.
+Скрипт распознаёт капчу и пишет предупреждение в лог, но обойти её не может.
 
-Запускается как бесконечный цикл (для сервера/Render) либо разово (cron).
+Режимы: RUN_MODE=loop (постоянный цикл, для Render) | once (один прогон).
+Само-тест Telegram: env SEND_TEST=1 — при старте шлёт тестовое сообщение.
 """
 
 import os
@@ -171,7 +175,6 @@ def parse_results(html: str, domain_host: str) -> list[dict]:
         if not asin:
             continue
 
-        # заголовок + ссылка
         h2 = card.select_one("h2")
         title = h2.get_text(strip=True) if h2 else ""
         link_el = card.select_one("h2 a") or card.select_one("a.a-link-normal")
@@ -179,11 +182,9 @@ def parse_results(html: str, domain_host: str) -> list[dict]:
         url = f"https://{domain_host}{href}" if href.startswith("/") else \
               (href or f"https://{domain_host}/dp/{asin}")
 
-        # текущая цена
         cur_el = card.select_one("span.a-price > span.a-offscreen")
         current = price_to_cents(cur_el.get_text()) if cur_el else None
 
-        # прежняя (зачёркнутая) цена
         was_el = card.select_one("span.a-price.a-text-price > span.a-offscreen")
         reference = price_to_cents(was_el.get_text()) if was_el else None
 
@@ -212,6 +213,19 @@ def size_matches(title: str, wanted_sizes: list[str]) -> bool:
     return False
 
 
+def keywords_match(title: str, must_groups: list) -> bool:
+    """Каждая группа обязательна; внутри группы достаточно одного совпадения.
+
+    Пример: [["peppermint", "lime green"], ["classic fit", "classic-fit"]]
+    → название должно содержать (peppermint ИЛИ lime green) И (classic fit).
+    """
+    blob = (title or "").lower()
+    for group in must_groups:
+        if not any(str(kw).lower() in blob for kw in group):
+            return False
+    return True
+
+
 def discount_percent(current: int | None, reference: int | None) -> float | None:
     if not current or not reference or reference <= current:
         return None
@@ -228,22 +242,39 @@ def check_watch(session, watch: dict) -> list[dict]:
     hits = []
     label = watch.get("label", watch.get("brand", "—"))
     query = watch["query"]
-    min_discount = watch["min_discount"]
+    min_discount = watch.get("min_discount")   # % (опционально)
+    max_price = watch.get("max_price")         # USD (опционально)
     wanted_sizes = watch.get("sizes", [])
+    must_groups = watch.get("must_match_any", [])
     domain_host = DOMAINS.get(watch.get("domain", "US"), DOMAINS["US"])
 
-    log.info("→ '%s' (скидка ≥%s%%, размеры %s)",
-             query, min_discount, wanted_sizes or "любые")
+    cond = []
+    if max_price is not None:
+        cond.append(f"цена <${max_price}")
+    if min_discount is not None:
+        cond.append(f"скидка ≥{min_discount}%")
+    log.info("→ '%s' (%s, размеры %s)", query,
+             ", ".join(cond) or "без порога", wanted_sizes or "любые")
 
     html = fetch_search(session, domain_host, query)
     if not html:
         return hits
 
     for p in parse_results(html, domain_host):
+        # 1) порог по абсолютной цене
+        if max_price is not None:
+            if p["current"] is None or p["current"] >= int(max_price * 100):
+                continue
+        # 2) порог по проценту скидки (если задан)
         disc = discount_percent(p["current"], p["reference"])
-        if disc is None or disc < min_discount:
-            continue
+        if min_discount is not None:
+            if disc is None or disc < min_discount:
+                continue
+        # 3) размер
         if not size_matches(p["title"], wanted_sizes):
+            continue
+        # 4) обязательные слова: цвет, крой и т.п.
+        if not keywords_match(p["title"], must_groups):
             continue
         hits.append({**p, "brand": watch.get("brand", ""),
                      "category": label, "discount": disc})
@@ -254,24 +285,24 @@ def check_watch(session, watch: dict) -> list[dict]:
 
 def build_message(hits: list[dict]) -> str:
     today = datetime.now().strftime("%d.%m.%Y %H:%M")
-    lines = [f"🛒 <b>Amazon — подходящие скидки</b> ({today})", ""]
+    lines = [f"🛒 <b>Amazon — подходящие предложения</b> ({today})", ""]
     by_cat: dict[str, list[dict]] = {}
     for h in hits:
         by_cat.setdefault(h["category"], []).append(h)
     for cat, items in by_cat.items():
-        items.sort(key=lambda x: x["discount"], reverse=True)
+        items.sort(key=lambda x: x["current"] or 0)
         lines.append(f"<b>{cat}</b>")
         for h in items:
             title = h["title"]
             if len(title) > 70:
                 title = title[:67] + "…"
-            lines.append(
-                f'• <a href="{h["url"]}">{title}</a>\n'
-                f'   {format_price(h["current"])} '
-                f'(было {format_price(h["reference"])}, −{h["discount"]:.0f}%)'
-            )
+            price_part = format_price(h["current"])
+            if h.get("discount") is not None and h.get("reference"):
+                price_part += (f' (было {format_price(h["reference"])},'
+                               f' −{h["discount"]:.0f}%)')
+            lines.append(f'• <a href="{h["url"]}">{title}</a>\n   {price_part}')
         lines.append("")
-    lines.append("⚡️ Хорошие размеры разбирают быстро — проверьте наличие сразу.")
+    lines.append("⚡️ Проверьте наличие размера/цвета по ссылке — разбирают быстро.")
     return "\n".join(lines)
 
 
@@ -323,7 +354,6 @@ def run_once(cfg, telegram_token, telegram_chat) -> None:
                 continue
             seen[key] = time.time()
             all_hits.append(h)
-        # случайная пауза между брендами, чтобы меньше походить на бота
         if i < len(cfg["watches"]) - 1:
             time.sleep(random.uniform(5, 15))
 
@@ -355,13 +385,12 @@ def main() -> None:
              run_mode, interval)
     start_health_server()
 
-    # Само-тест доставки в Telegram: задайте env SEND_TEST=1 и перезапустите,
-    # чтобы получить одно тестовое сообщение (проверка бота, минуя парсинг).
+    # Само-тест доставки в Telegram: SEND_TEST=1 → одно тестовое сообщение.
     if os.environ.get("SEND_TEST") == "1":
         ok = send_telegram(
             telegram_token, telegram_chat,
-            "✅ <b>Amazon Deal Watcher</b>\nТестовое сообщение — бот и уведомления работают. "
-            "Уберите переменную SEND_TEST, чтобы не повторять."
+            "✅ <b>Amazon Deal Watcher</b>\nТестовое сообщение — бот и уведомления "
+            "работают. Уберите переменную SEND_TEST, чтобы не повторять."
         )
         log.info("SEND_TEST: тестовое сообщение отправлено — %s", ok)
 
